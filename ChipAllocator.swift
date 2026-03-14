@@ -7,7 +7,7 @@
 
 import Foundation
 
-struct AllocationResult {
+struct AllocationResult: Sendable {
     var perPlayer: [ChipType: Int]
     var bankLeft: [ChipType: Int]
     var perPlayerTotalCents: Int
@@ -32,7 +32,7 @@ struct AutoOptimizationResult: Sendable {
 enum ChipAllocator: Sendable {
 
     static let availableDenoms: [Int] = [
-        10, 25, 50, 100, 200, 500, 1000, 2500, 5000, 10000, 50000
+        10, 25, 50, 100, 500, 1000, 2500, 5000, 10000, 50000
     ]
 
     // MARK: - Manual Allocation
@@ -330,25 +330,55 @@ enum ChipAllocator: Sendable {
             .map(\.value)
             .reduce(0, +)
 
+        let mediumChipCount = allocation
+            .filter { $0.key.denominationCents <= max(bigBlindCents * 5, smallBlindCents) }
+            .map(\.value)
+            .reduce(0, +)
+
         let blindPostsPossible = maxBlindPostsPossible(
             smallBlindCents: smallBlindCents,
             allocation: allocation,
-            cap: 8
+            cap: 10
         )
 
-        let chipCountPenalty = abs(totalChips - 25) * 4
+        let oversizedChipPenalty = allocation.reduce(0) { partial, item in
+            let denom = item.key.denominationCents
+            let count = item.value
 
-        let tooManyHugeChipsPenalty = allocation
-            .filter { $0.key.denominationCents > max(bigBlindCents * 10, 1000) }
-            .map(\.value)
-            .reduce(0, +) * 3
+            if denom <= bigBlindCents { return partial }
+
+            let ratio = max(1, denom / max(bigBlindCents, 1))
+            return partial + (ratio * count * 8)
+        }
+
+        let veryLargeChipPenalty = allocation.reduce(0) { partial, item in
+            let denom = item.key.denominationCents
+            let count = item.value
+
+            if denom >= max(bigBlindCents * 5, 500) {
+                return partial + (count * 40)
+            }
+            return partial
+        }
+
+        let tooFewLowChipPenalty = max(0, 8 - lowChipCount) * 180
+        let tooFewSmallBlindChipPenalty = max(0, 4 - exactSBChipCount) * 220
+        let tooFewMediumChipPenalty = max(0, 14 - mediumChipCount) * 65
+
+        let targetChipCount = 30
+        let chipCountPenalty = abs(totalChips - targetChipCount) * 5
 
         return
-            (exactSBChipCount * 250) +
-            (blindPostsPossible * 120) +
-            (min(lowChipCount, 14) * 30) -
-            chipCountPenalty -
-            tooManyHugeChipsPenalty
+            (exactSBChipCount * 260) +
+            (lowChipCount * 85) +
+            (mediumChipCount * 28) +
+            (blindPostsPossible * 130) -
+            oversizedChipPenalty -
+            veryLargeChipPenalty -
+            tooFewLowChipPenalty -
+            tooFewSmallBlindChipPenalty -
+            tooFewMediumChipPenalty -
+            chipCountPenalty
     }
 
     // MARK: - Auto Candidate Denoms
@@ -372,17 +402,18 @@ enum ChipAllocator: Sendable {
         }
 
         for denom in filteredDenoms {
-            if denom <= max(buyInCents, bigBlindCents * 20) {
+            if denom <= max(buyInCents, bigBlindCents * 12) {
                 pool.insert(denom)
             }
         }
 
+        // Prefer smaller denominations first in the search pool
         let sortedPool = Array(pool).sorted()
 
         if colorCount <= 6 {
             return sortedPool
         } else {
-            return Array(sortedPool.prefix(min(sortedPool.count, colorCount + 3)))
+            return Array(sortedPool.prefix(min(sortedPool.count, colorCount + 4)))
         }
     }
 
@@ -426,7 +457,7 @@ enum ChipAllocator: Sendable {
             suggestions.append("add more low denominations at or below the big blind for better playability")
         } else {
             let totalLowChipQty = lowChipTypes.reduce(0) { $0 + $1.quantity }
-            if players > 0 && totalLowChipQty / players < 3 {
+            if players > 0 && totalLowChipQty / players < 4 {
                 suggestions.append("add more low-denomination chips so each player gets a more playable starting stack")
             }
         }
@@ -439,7 +470,8 @@ enum ChipAllocator: Sendable {
             suggestions.append("choose a buy-in that matches your chip denominations more cleanly")
         }
 
-        if mode == "auto" && activeChips.count >= availableDenoms.filter({ $0 >= smallBlindCents }).count {
+        let validDenoms = availableDenoms.filter({ $0 >= smallBlindCents })
+        if mode == "auto" && activeChips.count >= validDenoms.count {
             suggestions.append("remove a chip color or widen the allowed denomination pool")
         }
 
