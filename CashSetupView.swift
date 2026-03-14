@@ -6,6 +6,8 @@
 //
 
 import SwiftUI
+import Combine
+import UIKit
 
 enum DenominationMode: String, CaseIterable, Identifiable {
     case manual = "Manual"
@@ -27,7 +29,7 @@ struct CashSetupView: View {
     @State private var reservePercent: Double = 0.30
 
     // MARK: - Blinds
-    @State private var bigBlindCents: Int = 100 // $1.00 default
+    @State private var bigBlindCents: Int = 100
 
     private let bigBlindOptions: [Int] = [
         25, 50, 100, 200, 500, 1000, 2000
@@ -51,19 +53,25 @@ struct CashSetupView: View {
     ]
 
     private let chipDenomOptions: [Int] = [
-        10, 25, 50, 100, 200, 500, 1000, 2500, 5000, 10000, 50000
+        10, 25, 50, 100, 500, 1000, 2500, 5000, 10000, 50000
     ]
 
     @State private var qtyText: [UUID: String] = [:]
 
     // MARK: - Results
     @State private var result: AllocationResult? = nil
+    @State private var showResultsSheet: Bool = false
 
     // MARK: - Help / UI
     @State private var showHelpSheet: Bool = false
     @State private var showChipSetsSheet: Bool = false
     @State private var showSaveChipSetAlert: Bool = false
     @State private var chipSetName: String = ""
+    @State private var showSaveChipSetErrorAlert: Bool = false
+    @State private var saveChipSetErrorMessage: String = ""
+
+    // MARK: - Row Editing
+    @State private var editingChipID: UUID? = nil
 
     // MARK: - Loading State
     @State private var isCalculating: Bool = false
@@ -87,6 +95,7 @@ struct CashSetupView: View {
 
     // MARK: - Keyboard
     @FocusState private var focusedField: Field?
+    @State private var keyboardHeight: CGFloat = 0
 
     // MARK: - Validation
     private var validationMessages: [String] {
@@ -147,122 +156,197 @@ struct CashSetupView: View {
         }
     }
 
+    private var hasUsableChipSetToSave: Bool {
+        currentSavedChipRows.contains(where: { $0.quantity > 0 })
+    }
+
+    private var totalChipBankValueCents: Int {
+        currentSavedChipRows.reduce(0) { partial, row in
+            partial + (row.denominationCents * row.quantity)
+        }
+    }
+
+    private var recommendedDenominations: [Int] {
+        let candidates = [smallBlindCents, bigBlindCents, bigBlindCents * 5]
+        let valid = candidates.compactMap { value in
+            chipDenomOptions.first(where: { $0 >= value })
+        }
+        return Array(NSOrderedSet(array: valid)) as? [Int] ?? valid
+    }
+
+    private var editingChip: ChipType? {
+        guard let editingChipID else { return nil }
+        return chips.first(where: { $0.id == editingChipID })
+    }
+
     var body: some View {
-        ZStack {
-            AppColors.background
-                .ignoresSafeArea()
-
-            ScrollView {
-                VStack(spacing: 20) {
-                    header
-                    actionBar
-                    gameSection
-                    blindsSection
-                    chipsSection
-
-                    if !validationMessages.isEmpty {
-                        validationSection
-                    }
-
-                    calculateButton
-
-                    if result != nil {
-                        resultSection
-                    }
-                }
-                .padding()
-            }
-            .onTapGesture {
-                focusedField = nil
-            }
-
-            if isCalculating {
-                Color.black.opacity(0.42)
+        ScrollViewReader { proxy in
+            ZStack {
+                AppColors.background
                     .ignoresSafeArea()
 
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(spacing: 10) {
-                        ProgressView()
-                            .scaleEffect(1.1)
-                            .tint(AppColors.accent)
+                ScrollView {
+                    VStack(spacing: 20) {
+                        header
+                        actionBar
+                        gameSection
+                        blindsSection
+                        recommendedDenomsSection
+                        chipsSection
+                        bankValueSection
 
-                        Text("Running Optimizer")
-                            .font(.headline)
-                            .foregroundStyle(AppColors.textPrimary)
+                        if !validationMessages.isEmpty {
+                            validationSection
+                        }
 
-                        Spacer()
+                        calculateButton
                     }
+                    .padding()
+                    .padding(.bottom, keyboardHeight > 0 ? keyboardHeight + 40 : 0)
+                }
+                .onTapGesture {
+                    focusedField = nil
+                }
+                .onChange(of: focusedField) {
+                    guard let targetID = scrollID(for: focusedField) else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(targetID, anchor: .center)
+                    }
+                }
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(loadingLogLines.enumerated()), id: \.offset) { index, line in
-                            HStack(alignment: .top, spacing: 8) {
-                                Text(">")
-                                    .foregroundStyle(index == loadingLogLines.count - 1 ? AppColors.accent : AppColors.textSecondary)
+                if isCalculating {
+                    Color.black.opacity(0.42)
+                        .ignoresSafeArea()
 
-                                Text(line)
-                                    .font(.system(.subheadline, design: .monospaced))
-                                    .foregroundStyle(index == loadingLogLines.count - 1 ? AppColors.textPrimary : AppColors.textSecondary)
-                                    .opacity(index == loadingLogLines.count - 1 ? 1.0 : 0.75)
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .scaleEffect(1.1)
+                                .tint(AppColors.accent)
 
-                                Spacer()
+                            Text("Running Optimizer")
+                                .font(.headline)
+                                .foregroundStyle(AppColors.textPrimary)
+
+                            Spacer()
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(loadingLogLines.enumerated()), id: \.offset) { index, line in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(">")
+                                        .foregroundStyle(index == loadingLogLines.count - 1 ? AppColors.accent : AppColors.textSecondary)
+
+                                    Text(line)
+                                        .font(.system(.subheadline, design: .monospaced))
+                                        .foregroundStyle(index == loadingLogLines.count - 1 ? AppColors.textPrimary : AppColors.textSecondary)
+                                        .opacity(index == loadingLogLines.count - 1 ? 1.0 : 0.75)
+
+                                    Spacer()
+                                }
                             }
                         }
                     }
+                    .padding(20)
+                    .frame(maxWidth: 340, alignment: .leading)
+                    .background(AppColors.card)
+                    .cornerRadius(18)
+                    .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
+                    .padding(.horizontal, 24)
                 }
-                .padding(20)
-                .frame(maxWidth: 340, alignment: .leading)
-                .background(AppColors.card)
-                .cornerRadius(18)
-                .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
-                .padding(.horizontal, 24)
             }
-        }
-        .sheet(isPresented: $showHelpSheet) {
-            HelpAboutView()
-        }
-        .sheet(isPresented: $showChipSetsSheet) {
-            ChipSetsView(
-                currentChips: currentSavedChipRows,
-                onLoad: { savedRows in
-                    applyChipSet(savedRows)
+            .sheet(isPresented: $showHelpSheet) {
+                HelpAboutView()
+            }
+            .sheet(isPresented: $showChipSetsSheet) {
+                ChipSetsView(
+                    currentChips: currentSavedChipRows,
+                    onLoad: { savedRows in
+                        applyChipSet(savedRows)
+                    }
+                )
+            }
+            .sheet(isPresented: $showResultsSheet) {
+                if let result {
+                    ResultsSheetView(
+                        result: result,
+                        chips: chips,
+                        denominationMode: denominationMode,
+                        smallBlindCents: smallBlindCents,
+                        bigBlindCents: bigBlindCents,
+                        currentSavedChipRows: currentSavedChipRows
+                    )
                 }
-            )
-        }
-        .alert("Save Chip Set", isPresented: $showSaveChipSetAlert) {
-            TextField("Example: Home Game Set", text: $chipSetName)
+            }
+            .sheet(item: Binding(
+                get: { editingChip },
+                set: { newValue in editingChipID = newValue?.id }
+            )) { chip in
+                EditChipRowSheetView(
+                    chipColorOptions: chipColorOptions,
+                    chipDenomOptions: chipDenomOptions,
+                    smallBlindCents: smallBlindCents,
+                    denominationMode: denominationMode,
+                    colorName: chip.colorName,
+                    denominationCents: chip.denominationCents,
+                    quantityText: qtyText[chip.id] ?? String(chip.quantity),
+                    onSave: { colorName, denominationCents, quantity in
+                        updateChip(
+                            id: chip.id,
+                            colorName: colorName,
+                            denominationCents: denominationCents,
+                            quantity: quantity
+                        )
+                    }
+                )
+            }
+            .alert("Save Chip Set", isPresented: $showSaveChipSetAlert) {
+                TextField("Example: Home Game Set", text: $chipSetName)
 
-            Button("Cancel", role: .cancel) { }
+                Button("Cancel", role: .cancel) { }
 
-            Button("Save") {
-                saveNamedChipSet()
+                Button("Save") {
+                    saveNamedChipSet()
+                }
+            } message: {
+                Text("Save the current chip inventory as a reusable chip set.")
             }
-            .disabled(chipSetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || currentSavedChipRows.isEmpty)
-        } message: {
-            Text("Save the current chip inventory as a reusable chip set.")
-        }
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") {
-                    focusedField = nil
+            .alert("Unable to Save Chip Set", isPresented: $showSaveChipSetErrorAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(saveChipSetErrorMessage)
+            }
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        focusedField = nil
+                    }
                 }
             }
+            .onAppear {
+                loadSavedSetup()
+            }
+            .onChange(of: players) { saveCurrentSetup() }
+            .onChange(of: buyInText) { saveCurrentSetup() }
+            .onChange(of: reservePercent) { saveCurrentSetup() }
+            .onChange(of: bigBlindCents) { saveCurrentSetup() }
+            .onChange(of: denominationMode) { saveCurrentSetup() }
+            .onChange(of: chips) { saveCurrentSetup() }
+            .onChange(of: qtyText) { saveCurrentSetup() }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
+                guard let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+                keyboardHeight = frame.height * 0.72
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                keyboardHeight = 0
+            }
         }
-        .onAppear {
-            loadSavedSetup()
-        }
-        .onChange(of: players) { saveCurrentSetup() }
-        .onChange(of: buyInText) { saveCurrentSetup() }
-        .onChange(of: reservePercent) { saveCurrentSetup() }
-        .onChange(of: bigBlindCents) { saveCurrentSetup() }
-        .onChange(of: denominationMode) { saveCurrentSetup() }
-        .onChange(of: chips) { saveCurrentSetup() }
-        .onChange(of: qtyText) { saveCurrentSetup() }
     }
 
     // MARK: - Header
     private var header: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 6) {
             Text("POKER STACK")
                 .font(.largeTitle)
                 .fontWeight(.heavy)
@@ -270,6 +354,11 @@ struct CashSetupView: View {
 
             Text("Cash Game Setup")
                 .foregroundStyle(AppColors.textSecondary)
+
+            Text("Step 1: Set your game • Step 2: Add your chips • Step 3: Calculate")
+                .font(.footnote)
+                .foregroundStyle(AppColors.textSecondary)
+                .multilineTextAlignment(.center)
         }
         .padding(.top, 8)
     }
@@ -296,6 +385,13 @@ struct CashSetupView: View {
                 Button {
                     chipSetName = ""
                     focusedField = nil
+
+                    guard hasUsableChipSetToSave else {
+                        saveChipSetErrorMessage = "Create at least one chip color with a quantity greater than 0 before saving a chip set."
+                        showSaveChipSetErrorAlert = true
+                        return
+                    }
+
                     showSaveChipSetAlert = true
                 } label: {
                     Text("Save Set")
@@ -310,8 +406,6 @@ struct CashSetupView: View {
                         )
                         .cornerRadius(12)
                 }
-                .disabled(currentSavedChipRows.isEmpty)
-                .opacity(currentSavedChipRows.isEmpty ? 0.6 : 1.0)
             }
 
             HStack(spacing: 12) {
@@ -349,13 +443,18 @@ struct CashSetupView: View {
             }
         }
     }
-    // MARK: - Game Card
+
+    // MARK: - Sections
     private var gameSection: some View {
         CardView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("GAME")
+            VStack(alignment: .leading, spacing: 14) {
+                Text("STEP 1 • GAME")
                     .font(.caption)
                     .foregroundStyle(AppColors.accent)
+
+                Text("Set your players, buy-in, and reserve. Tap the box to edit the buy-in.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppColors.textSecondary)
 
                 Stepper("Players: \(players)", value: $players, in: 1...50)
                     .foregroundStyle(AppColors.textPrimary)
@@ -368,8 +467,17 @@ struct CashSetupView: View {
                             .keyboardType(.decimalPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 120)
-                            .foregroundStyle(AppColors.textSecondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.06))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                            )
+                            .cornerRadius(10)
+                            .foregroundStyle(AppColors.textPrimary)
                             .focused($focusedField, equals: .buyIn)
+                            .id("buyInField")
                     }
                     .foregroundStyle(AppColors.textPrimary)
 
@@ -387,13 +495,16 @@ struct CashSetupView: View {
         }
     }
 
-    // MARK: - Blinds Card
     private var blindsSection: some View {
         CardView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("BLINDS")
+            VStack(alignment: .leading, spacing: 14) {
+                Text("STEP 2 • BLINDS")
                     .font(.caption)
                     .foregroundStyle(AppColors.accent)
+
+                Text("Choose the big blind. Small blind updates automatically.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppColors.textSecondary)
 
                 HStack {
                     Text("Big Blind")
@@ -419,12 +530,42 @@ struct CashSetupView: View {
         }
     }
 
-    // MARK: - Chips Card
+    private var recommendedDenomsSection: some View {
+        CardView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("RECOMMENDED DENOMINATIONS")
+                    .font(.caption)
+                    .foregroundStyle(AppColors.accent)
+
+                Text("For this blind level, a strong starting mix is:")
+                    .font(.subheadline)
+                    .foregroundStyle(AppColors.textSecondary)
+
+                HStack(spacing: 10) {
+                    ForEach(recommendedDenominations, id: \.self) { denom in
+                        Text(Money.format(cents: denom))
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(AppColors.card)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                            )
+                            .cornerRadius(10)
+                            .foregroundStyle(AppColors.textPrimary)
+                    }
+                }
+            }
+        }
+    }
+
     private var chipsSection: some View {
         CardView {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("CHIPS")
+                    Text("STEP 3 • CHIPS")
                         .font(.caption)
                         .foregroundStyle(AppColors.accent)
 
@@ -442,6 +583,10 @@ struct CashSetupView: View {
                     }
                 }
 
+                Text("Tap any chip row to edit its details in a cleaner editor.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppColors.textSecondary)
+
                 Picker("Denomination Mode", selection: $denominationMode) {
                     ForEach(DenominationMode.allCases) { mode in
                         Text(mode.rawValue).tag(mode)
@@ -450,75 +595,82 @@ struct CashSetupView: View {
                 .pickerStyle(.segmented)
 
                 if chips.isEmpty {
-                    Text("No chips added yet. Tap “Add Color”.")
+                    Text("No chips added yet. Tap “Add Color” to start building your inventory.")
                         .foregroundStyle(AppColors.textSecondary)
                         .padding(.top, 6)
                 } else {
-                    ForEach($chips) { $chip in
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Picker("Color", selection: $chip.colorName) {
-                                    ForEach(chipColorOptions, id: \.self) { color in
-                                        Text(color).tag(color)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-
-                                Spacer()
-
-                                Button {
-                                    removeChipRow(id: chip.id)
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .foregroundStyle(.red.opacity(0.9))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .foregroundStyle(AppColors.textPrimary)
-
-                            if denominationMode == .manual {
+                    ForEach(chips) { chip in
+                        Button {
+                            editingChipID = chip.id
+                        } label: {
+                            VStack(alignment: .leading, spacing: 10) {
                                 HStack {
-                                    Text("Denomination")
+                                    Text(chip.colorName)
+                                        .font(.headline)
                                     Spacer()
-
-                                    Picker("", selection: $chip.denominationCents) {
-                                        ForEach(chipDenomOptions.filter { $0 >= smallBlindCents }, id: \.self) { cents in
-                                            Text(Money.format(cents: cents)).tag(cents)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                }
-                                .foregroundStyle(AppColors.textPrimary)
-                            } else {
-                                HStack {
-                                    Text("Denomination")
-                                    Spacer()
-                                    Text("Auto")
+                                    Text(Money.format(cents: chip.denominationCents))
                                         .foregroundStyle(AppColors.textSecondary)
                                 }
-                                .foregroundStyle(AppColors.textPrimary)
-                            }
 
-                            HStack {
-                                Text("Quantity")
-                                Spacer()
+                                HStack {
+                                    Text("Quantity")
+                                    Spacer()
+                                    Text(qtyText[chip.id] ?? String(chip.quantity))
+                                        .fontWeight(.semibold)
+                                }
 
-                                TextField("0", text: Binding(
-                                    get: { qtyText[chip.id] ?? String(chip.quantity) },
-                                    set: { qtyText[chip.id] = $0 }
-                                ))
-                                .keyboardType(.numberPad)
-                                .multilineTextAlignment(.trailing)
-                                .frame(width: 110)
-                                .focused($focusedField, equals: .quantity(chip.id))
+                                Text("Tap to edit")
+                                    .font(.caption)
+                                    .foregroundStyle(AppColors.textSecondary)
+
+                                Divider()
+                                    .background(Color.white.opacity(0.08))
                             }
                             .foregroundStyle(AppColors.textPrimary)
-
-                            Divider()
-                                .background(Color.white.opacity(0.08))
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
+
+                HStack(spacing: 12) {
+                    Button {
+                        resetChipInventory()
+                    } label: {
+                        Text("Reset Chip Inventory")
+                            .fontWeight(.semibold)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(AppColors.card)
+                            .foregroundStyle(.red)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                            )
+                            .cornerRadius(12)
+                    }
+                    .disabled(chips.isEmpty)
+                    .opacity(chips.isEmpty ? 0.6 : 1.0)
+                }
+            }
+        }
+    }
+
+    private var bankValueSection: some View {
+        CardView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("CHIP BANK")
+                    .font(.caption)
+                    .foregroundStyle(AppColors.accent)
+
+                HStack {
+                    Text("Total Chip Bank Value")
+                    Spacer()
+                    Text(Money.format(cents: totalChipBankValueCents))
+                        .fontWeight(.semibold)
+                        .foregroundStyle(AppColors.textSecondary)
+                }
+                .foregroundStyle(AppColors.textPrimary)
             }
         }
     }
@@ -543,7 +695,6 @@ struct CashSetupView: View {
         }
     }
 
-    // MARK: - Calculate Button
     private var calculateButton: some View {
         Button(action: {
             Task {
@@ -560,140 +711,6 @@ struct CashSetupView: View {
         }
         .disabled(chips.isEmpty || isCalculating || hasBlockingValidation)
         .opacity((chips.isEmpty || isCalculating || hasBlockingValidation) ? 0.6 : 1.0)
-    }
-
-    // MARK: - Results Card
-    private var resultSection: some View {
-        guard let result else { return AnyView(EmptyView()) }
-
-        return AnyView(
-            CardView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("RESULTS")
-                        .font(.caption)
-                        .foregroundStyle(AppColors.accent)
-
-                    HStack {
-                        Text("Blinds")
-                        Spacer()
-                        Text("SB \(Money.format(cents: smallBlindCents)) • BB \(Money.format(cents: bigBlindCents))")
-                            .foregroundStyle(AppColors.textSecondary)
-                    }
-                    .foregroundStyle(AppColors.textPrimary)
-
-                    Text("Give Each Player")
-                        .font(.headline)
-                        .foregroundStyle(AppColors.textPrimary)
-
-                    let sortedChips = chips.sorted(by: { $0.denominationCents > $1.denominationCents })
-                    ForEach(sortedChips, id: \.self) { t in
-                        let count = result.perPlayer[t] ?? 0
-                        if count > 0 {
-                            HStack {
-                                Text("\(t.colorName) (\(Money.format(cents: t.denominationCents)))")
-                                Spacer()
-                                Text("\(count)")
-                            }
-                            .foregroundStyle(AppColors.textPrimary)
-                        }
-                    }
-
-                    HStack {
-                        Text("Per Player Total")
-                        Spacer()
-                        Text(result.perPlayerTotalString)
-                            .foregroundStyle(AppColors.textSecondary)
-                    }
-                    .foregroundStyle(AppColors.textPrimary)
-
-                    Divider()
-                        .background(Color.white.opacity(0.08))
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Why this works")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(AppColors.textPrimary)
-
-                        HStack {
-                            Text("Chips per player")
-                            Spacer()
-                            Text("\(result.totalChipsPerPlayer)")
-                                .foregroundStyle(AppColors.textSecondary)
-                        }
-
-                        HStack {
-                            Text("Low chips per player")
-                            Spacer()
-                            Text("\(result.lowChipCountPerPlayer)")
-                                .foregroundStyle(AppColors.textSecondary)
-                        }
-
-                        HStack {
-                            Text("Small blind posts possible")
-                            Spacer()
-                            Text("\(result.blindPostsPossible)x")
-                                .foregroundStyle(AppColors.textSecondary)
-                        }
-
-                        HStack {
-                            Text("Reserve bank left")
-                            Spacer()
-                            Text(result.reserveBankTotalString)
-                                .foregroundStyle(AppColors.textSecondary)
-                        }
-                    }
-                    .foregroundStyle(AppColors.textPrimary)
-
-                    if denominationMode == .auto {
-                        Divider()
-                            .background(Color.white.opacity(0.08))
-
-                        Text("Assigned Denominations")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(AppColors.textPrimary)
-
-                        ForEach(chips, id: \.self) { chip in
-                            HStack {
-                                Text(chip.colorName)
-                                Spacer()
-                                Text(Money.format(cents: chip.denominationCents))
-                                    .foregroundStyle(AppColors.textSecondary)
-                            }
-                            .foregroundStyle(AppColors.textPrimary)
-                        }
-                    }
-
-                    Divider()
-                        .background(Color.white.opacity(0.08))
-
-                    Text("Bank Left")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(AppColors.textPrimary)
-
-                    ForEach(sortedChips, id: \.self) { t in
-                        let left = result.bankLeft[t] ?? 0
-                        if left > 0 {
-                            HStack {
-                                Text("\(t.colorName) (\(Money.format(cents: t.denominationCents)))")
-                                Spacer()
-                                Text("\(left)")
-                                    .foregroundStyle(AppColors.textSecondary)
-                            }
-                            .foregroundStyle(AppColors.textPrimary)
-                        }
-                    }
-
-                    Divider()
-                        .background(Color.white.opacity(0.08))
-
-                    Text(result.message)
-                        .foregroundStyle(result.feasible ? .green : .orange)
-                }
-            }
-        )
     }
 
     // MARK: - Logic
@@ -730,6 +747,8 @@ struct CashSetupView: View {
             await enforceMinimumLoadingTime(startTime: startTime)
             stopLoadingMessages()
             isCalculating = false
+            showResultsSheet = true
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
             return
         }
 
@@ -744,7 +763,7 @@ struct CashSetupView: View {
 
         let calculationResult: (updatedChips: [ChipType]?, allocation: AllocationResult) = await Task.detached(priority: .userInitiated) { @Sendable in
             if currentMode == .auto {
-                let optimized = await ChipAllocator.optimizeAuto(
+                let optimized = ChipAllocator.optimizeAuto(
                     chips: currentChips,
                     players: currentPlayers,
                     buyInCents: buyInCents,
@@ -754,7 +773,7 @@ struct CashSetupView: View {
                 )
                 return (updatedChips: optimized.chips, allocation: optimized.allocation)
             } else {
-                let allocation = await ChipAllocator.allocate(
+                let allocation = ChipAllocator.allocate(
                     chips: currentChips,
                     players: currentPlayers,
                     buyInCents: buyInCents,
@@ -779,6 +798,10 @@ struct CashSetupView: View {
         await enforceMinimumLoadingTime(startTime: startTime)
         stopLoadingMessages()
         isCalculating = false
+        showResultsSheet = true
+
+        let feedback = UINotificationFeedbackGenerator()
+        feedback.notificationOccurred(calculationResult.allocation.feasible ? .success : .warning)
     }
 
     private func startLoadingMessages() {
@@ -851,7 +874,7 @@ struct CashSetupView: View {
         let rebuiltChips = saved.chips.map {
             ChipType(
                 colorName: $0.colorName,
-                denominationCents: $0.denominationCents,
+                denominationCents: $0.denominationCents == 200 ? 100 : $0.denominationCents,
                 quantity: $0.quantity
             )
         }
@@ -874,16 +897,26 @@ struct CashSetupView: View {
         chips = []
         qtyText = [:]
         result = nil
+        showResultsSheet = false
         focusedField = nil
         stopLoadingMessages()
         CashSetupStore.clear()
+    }
+
+    private func resetChipInventory() {
+        chips = []
+        qtyText = [:]
+        result = nil
+        showResultsSheet = false
+        saveCurrentSetup()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     private func applyChipSet(_ savedRows: [SavedChipRow]) {
         let rebuiltChips = savedRows.map {
             ChipType(
                 colorName: $0.colorName,
-                denominationCents: $0.denominationCents,
+                denominationCents: $0.denominationCents == 200 ? 100 : $0.denominationCents,
                 quantity: $0.quantity
             )
         }
@@ -897,16 +930,56 @@ struct CashSetupView: View {
         qtyText = rebuiltQtyText
 
         result = nil
+        showResultsSheet = false
         saveCurrentSetup()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
-    
+
     private func saveNamedChipSet() {
         let trimmed = chipSetName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard !currentSavedChipRows.isEmpty else { return }
+
+        guard !trimmed.isEmpty else {
+            saveChipSetErrorMessage = "Enter a name for the chip set before saving."
+            showSaveChipSetErrorAlert = true
+            return
+        }
+
+        guard hasUsableChipSetToSave else {
+            saveChipSetErrorMessage = "Create at least one chip color with a quantity greater than 0 before saving a chip set."
+            showSaveChipSetErrorAlert = true
+            return
+        }
 
         ChipSetStore.save(name: trimmed, chips: currentSavedChipRows)
         chipSetName = ""
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    private func updateChip(id: UUID, colorName: String, denominationCents: Int, quantity: Int) {
+        guard let index = chips.firstIndex(where: { $0.id == id }) else { return }
+        chips[index].colorName = colorName
+        chips[index].denominationCents = denominationCents
+        chips[index].quantity = quantity
+        qtyText[id] = String(quantity)
+        result = nil
+        saveCurrentSetup()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    // MARK: - Focus Helpers
+    private func quantityFieldID(for id: UUID) -> String {
+        "quantity-\(id.uuidString)"
+    }
+
+    private func scrollID(for field: Field?) -> String? {
+        switch field {
+        case .buyIn:
+            return "buyInField"
+        case .quantity(let id):
+            return quantityFieldID(for: id)
+        case .none:
+            return nil
+        }
     }
 
     // MARK: - Chip Row Helpers
@@ -920,13 +993,17 @@ struct CashSetupView: View {
         chips.append(newChip)
         qtyText[newChip.id] = "0"
         result = nil
+        showResultsSheet = false
         saveCurrentSetup()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     private func removeChipRow(id: UUID) {
         chips.removeAll { $0.id == id }
         qtyText[id] = nil
         result = nil
+        showResultsSheet = false
         saveCurrentSetup()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 }
