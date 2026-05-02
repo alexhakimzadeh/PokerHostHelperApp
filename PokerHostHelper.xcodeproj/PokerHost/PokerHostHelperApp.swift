@@ -8,10 +8,10 @@
 import SwiftUI
 
 @main
-struct PokerHostHelperApp: App {
+struct YourAppNameApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            CashSetupView()
         }
     }
 }
