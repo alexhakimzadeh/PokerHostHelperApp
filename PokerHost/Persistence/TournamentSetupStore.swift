@@ -15,7 +15,6 @@ struct SavedTournamentSetup: Codable {
     let plannedAddOns: Int
     let addOnValueTexts: [String]
     let blindSpeedRawValue: String
-    let denominationModeRawValue: String
     let chips: [SavedChipRow]
 
     private enum CodingKeys: String, CodingKey {
@@ -26,7 +25,6 @@ struct SavedTournamentSetup: Codable {
         case plannedAddOns
         case addOnValueTexts
         case blindSpeedRawValue
-        case denominationModeRawValue
         case chips
     }
 
@@ -38,7 +36,6 @@ struct SavedTournamentSetup: Codable {
         plannedAddOns: Int,
         addOnValueTexts: [String],
         blindSpeedRawValue: String,
-        denominationModeRawValue: String,
         chips: [SavedChipRow]
     ) {
         self.players = players
@@ -48,7 +45,6 @@ struct SavedTournamentSetup: Codable {
         self.plannedAddOns = plannedAddOns
         self.addOnValueTexts = addOnValueTexts
         self.blindSpeedRawValue = blindSpeedRawValue
-        self.denominationModeRawValue = denominationModeRawValue
         self.chips = chips
     }
 
@@ -61,7 +57,6 @@ struct SavedTournamentSetup: Codable {
         plannedAddOns = try container.decode(Int.self, forKey: .plannedAddOns)
         addOnValueTexts = try container.decodeIfPresent([String].self, forKey: .addOnValueTexts) ?? ["10", "20"]
         blindSpeedRawValue = try container.decode(String.self, forKey: .blindSpeedRawValue)
-        denominationModeRawValue = try container.decode(String.self, forKey: .denominationModeRawValue)
         chips = try container.decode([SavedChipRow].self, forKey: .chips)
     }
 }

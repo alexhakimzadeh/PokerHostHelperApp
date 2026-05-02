@@ -70,7 +70,7 @@ enum ChipAllocator: Sendable {
     ]
 
     static let availableDenoms: [Int] = [
-        10, 25, 50, 100, 500, 1000, 2500, 5000, 10000, 50000
+        25, 50, 100, 500, 1000, 2500, 5000, 10000, 25000, 50000
     ]
 
     static func allocate(

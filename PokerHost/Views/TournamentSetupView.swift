@@ -53,6 +53,33 @@ struct TournamentSetupView: View {
         let percentage: Int
     }
 
+    private struct AddOnValueInput: Identifiable, Equatable {
+        let id: UUID
+        var text: String
+
+        init(id: UUID = UUID(), text: String) {
+            self.id = id
+            self.text = text
+        }
+    }
+
+    private struct CalculationSnapshot: Identifiable {
+        let id = UUID()
+        let allocation: AllocationResult
+        let chips: [ChipType]
+        let buyInCents: Int
+        let playerCount: Int
+        let entrantCount: Int
+        let estimatedDurationText: String
+        let blindSchedule: [BlindLevel]
+        let totalPrizePoolCents: Int
+        let startingPlayers: Int
+        let plannedLateRegistrations: Int
+        let plannedRebuys: Int
+        let plannedAddOns: Int
+        let addOnValueTexts: [String]
+    }
+
     struct BlindLevel: Identifiable, Hashable {
         let level: Int
         let smallBlind: Int
@@ -67,16 +94,17 @@ struct TournamentSetupView: View {
     @State private var plannedLateRegistrations = 0
     @State private var plannedRebuys = 0
     @State private var plannedAddOns = 0
-    @State private var addOnValueTexts: [String] = ["10", "20"]
+    @State private var addOnValues: [AddOnValueInput] = [
+        AddOnValueInput(text: "10"),
+        AddOnValueInput(text: "20")
+    ]
     @State private var blindSpeed: BlindSpeed = .regular
     @State private var chips: [ChipType] = []
     @State private var qtyText: [UUID: String] = [:]
     @State private var showChipSetsSheet = false
     @State private var editingChipID: UUID? = nil
     @State private var showFollowUpNote = false
-    @State private var showResultsSheet = false
-    @State private var calculatedAllocation: AllocationResult? = nil
-    @State private var calculatedChips: [ChipType] = []
+    @State private var calculationSnapshot: CalculationSnapshot? = nil
     @State private var isCalculating = false
     @FocusState private var focusedField: Field?
 
@@ -86,7 +114,7 @@ struct TournamentSetupView: View {
     ]
 
     private let chipDenomOptions: [Int] = [
-        25, 100, 500, 1000, 5000, 10000, 25000, 50000
+        25, 50, 100, 500, 1000, 2500, 5000, 10000, 25000, 50000
     ]
 
     private let openingBlindOptions: [Int] = [
@@ -114,10 +142,22 @@ struct TournamentSetupView: View {
         buyInCents * totalPaidEntries
     }
 
+    private var tournamentStartingStackUnits: Int {
+        switch blindSpeed {
+        case .turbo: return 6_000
+        case .regular: return 10_000
+        }
+    }
+
     private var parsedAddOnValueTexts: [String] {
-        addOnValueTexts
+        addOnValues
+            .map(\.text)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { (Money.cents(from: $0) ?? 0) > 0 }
+            .compactMap { text -> String? in
+                guard let cents = Money.cents(from: text), cents > 0 else { return nil }
+                return Money.format(cents: cents).replacingOccurrences(of: "$", with: "")
+            }
+            .uniqued()
     }
 
     private var totalChipBankUnits: Int {
@@ -129,7 +169,7 @@ struct TournamentSetupView: View {
     private var chipsWithAppliedQuantities: [ChipType] {
         chips.map { chip in
             var updated = chip
-            let quantity = Int((qtyText[chip.id] ?? String(chip.quantity)).trimmingCharacters(in: .whitespacesAndNewlines)) ?? chip.quantity
+            let quantity = parsedQuantity(for: chip) ?? 0
             updated.quantity = max(quantity, 0)
             return updated
         }
@@ -146,16 +186,16 @@ struct TournamentSetupView: View {
     }
 
     private var openingBigBlind: Int {
-        let suggested = max(buyInCents / max(blindSpeed.targetBigBlinds, 1), openingBlindOptions.first ?? 25)
+        let suggested = max(tournamentStartingStackUnits / max(blindSpeed.targetBigBlinds, 1), openingBlindOptions.first ?? 25)
         return openingBlindOptions.last(where: { $0 <= suggested }) ?? (openingBlindOptions.first ?? 25)
     }
 
     private var openingSmallBlind: Int {
-        max(openingBigBlind / 2, 25)
+        max(openingBigBlind / 2, openingBlindOptions.first ?? 25)
     }
 
     private var startingStackUnits: Int {
-        calculatedAllocation?.perPlayerTotalCents ?? buyInCents
+        calculationSnapshot?.allocation.perPlayerTotalCents ?? tournamentStartingStackUnits
     }
 
     private var estimatedDurationText: String {
@@ -205,20 +245,7 @@ struct TournamentSetupView: View {
     }
 
     private var payoutBreakdown: [PrizePayout] {
-        let percents: [Int]
-
-        switch initialEntrants {
-        case 0...2:
-            percents = [100]
-        case 3...4:
-            percents = [70, 30]
-        case 5...7:
-            percents = [60, 30, 10]
-        case 8...10:
-            percents = [50, 30, 20]
-        default:
-            percents = [45, 25, 15, 10, 5]
-        }
+        let percents = Self.payoutPercentages(forEntrants: initialEntrants)
 
         var payouts: [PrizePayout] = []
         var awarded = 0
@@ -258,7 +285,12 @@ struct TournamentSetupView: View {
         }
 
         for chip in chips {
-            let quantity = Int((qtyText[chip.id] ?? String(chip.quantity)).trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
+            let quantityText = (qtyText[chip.id] ?? String(chip.quantity)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !quantityText.isEmpty else { continue }
+            guard let quantity = Int(quantityText) else {
+                messages.append("\(chip.colorName) quantity must be a whole number.")
+                continue
+            }
 
             if quantity < 0 {
                 messages.append("\(chip.colorName) quantity must be 0 or greater.")
@@ -266,11 +298,11 @@ struct TournamentSetupView: View {
 
         }
 
-        if !chips.contains(where: { (Int(qtyText[$0.id] ?? String($0.quantity)) ?? 0) > 0 }) {
+        if !chips.contains(where: { (parsedQuantity(for: $0) ?? 0) > 0 }) {
             messages.append("Add at least one chip color with a quantity greater than 0.")
         }
 
-        return Array(Set(messages)).sorted()
+        return messages.uniqued()
     }
 
     var body: some View {
@@ -282,6 +314,8 @@ struct TournamentSetupView: View {
                 VStack(spacing: 20) {
                     header
                     fieldSection
+                    planningSection
+                    payoutsSection
                     chipSection
 
                     if !validationMessages.isEmpty {
@@ -321,31 +355,30 @@ struct TournamentSetupView: View {
         .onTapGesture {
             focusedField = nil
         }
-        .navigationTitle("Tournament Beta")
+        .navigationTitle("Tournament")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showChipSetsSheet) {
             ChipSetsView(currentChips: currentSavedChipRows) { savedRows in
                 applyChipSet(savedRows)
             }
         }
-        .sheet(isPresented: $showResultsSheet) {
-            if let calculatedAllocation {
-                TournamentResultsSheetView(
-                    blindSpeed: blindSpeed.rawValue,
-                    buyInText: Money.format(cents: buyInCents),
-                    playerCount: totalPaidEntries,
-                    allocation: calculatedAllocation,
-                    chips: calculatedChips,
-                    estimatedDurationText: estimatedDurationText,
-                    blindSchedule: blindSchedule,
-                    totalPrizePoolCents: totalPrizePoolCents,
-                    startingPlayers: players,
-                    plannedLateRegistrations: plannedLateRegistrations,
-                    plannedRebuys: plannedRebuys,
-                    plannedAddOns: plannedAddOns,
-                    addOnValueTexts: parsedAddOnValueTexts
-                )
-            }
+        .sheet(item: $calculationSnapshot) { snapshot in
+            TournamentResultsSheetView(
+                blindSpeed: blindSpeed.rawValue,
+                buyInCents: snapshot.buyInCents,
+                playerCount: snapshot.playerCount,
+                entrantCount: snapshot.entrantCount,
+                allocation: snapshot.allocation,
+                chips: snapshot.chips,
+                estimatedDurationText: snapshot.estimatedDurationText,
+                blindSchedule: snapshot.blindSchedule,
+                totalPrizePoolCents: snapshot.totalPrizePoolCents,
+                startingPlayers: snapshot.startingPlayers,
+                plannedLateRegistrations: snapshot.plannedLateRegistrations,
+                plannedRebuys: snapshot.plannedRebuys,
+                plannedAddOns: snapshot.plannedAddOns,
+                addOnValueTexts: snapshot.addOnValueTexts
+            )
         }
         .sheet(
             isPresented: Binding(
@@ -384,7 +417,7 @@ struct TournamentSetupView: View {
         .onChange(of: plannedLateRegistrations) { handleSetupChange() }
         .onChange(of: plannedRebuys) { handleSetupChange() }
         .onChange(of: plannedAddOns) { handleSetupChange() }
-        .onChange(of: addOnValueTexts) { handleSetupChange() }
+        .onChange(of: addOnValues) { handleSetupChange() }
         .onChange(of: blindSpeed) { handleSetupChange() }
         .onChange(of: qtyText) { handleSetupChange() }
         .toolbar {
@@ -395,21 +428,21 @@ struct TournamentSetupView: View {
                 }
             }
         }
-        .alert("Subscription Follow-Up", isPresented: $showFollowUpNote) {
+        .alert("Tournament Setup Saved", isPresented: $showFollowUpNote) {
             Button("OK", role: .cancel) { }
         } message: {
-            Text("PokerStackPlus purchase wiring is intentionally still mocked. Keep this on the V2.0 release checklist before shipping.")
+            Text("We saved this tournament setup. PokerStack Plus reminders will be available in a future update.")
         }
     }
 
     private var header: some View {
         VStack(spacing: 8) {
-            Text("TOURNAMENT MODE BETA")
+            Text("TOURNAMENT MODE")
                 .font(.largeTitle)
                 .fontWeight(.heavy)
                 .foregroundStyle(AppColors.textPrimary)
 
-            Text("Build a tournament plan with smart blind suggestions, stack coverage, and automatic payouts. Beta testing is active.")
+            Text("Build a tournament plan with smart blind suggestions, stack coverage, and automatic payouts.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(AppColors.textSecondary)
         }
@@ -487,21 +520,18 @@ struct TournamentSetupView: View {
                     Text("Add-On Values")
                         .foregroundStyle(AppColors.textPrimary)
 
-                    ForEach(Array(addOnValueTexts.enumerated()), id: \.offset) { index, _ in
+                    ForEach($addOnValues) { $addOnValue in
                         HStack(spacing: 10) {
                             Text("$")
                                 .foregroundStyle(AppColors.textSecondary)
 
-                            TextField("20", text: Binding(
-                                get: { addOnValueTexts[index] },
-                                set: { addOnValueTexts[index] = $0 }
-                            ))
+                            TextField("20", text: $addOnValue.text)
                             .keyboardType(.decimalPad)
                             .foregroundStyle(AppColors.textPrimary)
 
                             Button(role: .destructive) {
-                                guard addOnValueTexts.count > 1 else { return }
-                                addOnValueTexts.remove(at: index)
+                                guard addOnValues.count > 1 else { return }
+                                addOnValues.removeAll { $0.id == addOnValue.id }
                             } label: {
                                 Image(systemName: "minus.circle")
                                     .foregroundStyle(.red)
@@ -518,7 +548,10 @@ struct TournamentSetupView: View {
                     }
 
                     Button("Add Add-On Value") {
-                        addOnValueTexts.append(buyInText.isEmpty ? "10" : buyInText)
+                        let fallback = normalizedMoneyText(buyInText) ?? "10.00"
+                        let existing = Set(parsedAddOnValueTexts)
+                        let nextText = existing.contains(fallback) ? nextAddOnValueText(existing: existing) : fallback
+                        addOnValues.append(AddOnValueInput(text: nextText))
                     }
                     .font(.caption)
                     .fontWeight(.semibold)
@@ -588,7 +621,7 @@ struct TournamentSetupView: View {
                             Spacer()
 
                             VStack(alignment: .trailing, spacing: 6) {
-                                if calculatedAllocation != nil {
+                                if calculationSnapshot != nil {
                                     Text(formatTournamentUnits(chip.denominationCents))
                                         .font(.headline)
                                         .foregroundStyle(AppColors.textPrimary)
@@ -649,7 +682,7 @@ struct TournamentSetupView: View {
                 summaryRow("Suggested opening blind", "\(formatTournamentUnits(openingSmallBlind)) / \(formatTournamentUnits(openingBigBlind))")
                 summaryRow("Estimated duration", estimatedDurationText)
 
-                if let allocation = calculatedAllocation {
+                if let allocation = calculationSnapshot?.allocation {
                     summaryRow("Suggested starting stack", formatTournamentUnits(allocation.perPlayerTotalCents))
                     summaryRow("Chips per entry", "\(allocation.totalChipsPerPlayer)")
                     summaryRow("Bank left after all planned entries", formatTournamentUnits(allocation.reserveBankTotalCents))
@@ -672,7 +705,7 @@ struct TournamentSetupView: View {
                     .font(.caption)
                     .foregroundStyle(AppColors.accent)
 
-                Text("Winner-heavy defaults are based on your confirmed V2.0 rules.")
+                Text("Winner-heavy defaults scale with the number of entrants.")
                     .font(.subheadline)
                     .foregroundStyle(AppColors.textSecondary)
 
@@ -713,7 +746,7 @@ struct TournamentSetupView: View {
             saveCurrentSetup()
             showFollowUpNote = true
         } label: {
-            Text("Remember Subscription Follow-Up")
+            Text("SAVE TOURNAMENT SETUP")
                 .fontWeight(.bold)
                 .frame(maxWidth: .infinity)
                 .padding()
@@ -762,6 +795,46 @@ struct TournamentSetupView: View {
 
     private func formatTournamentUnits(_ value: Int) -> String {
         value.formatted(.number.grouping(.automatic))
+    }
+
+    private func parsedQuantity(for chip: ChipType) -> Int? {
+        let text = (qtyText[chip.id] ?? String(chip.quantity)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return Int(text)
+    }
+
+    private func nextAddOnValueText(existing: Set<String>) -> String {
+        let buyIn = max(Money.cents(from: buyInText) ?? 0, 0)
+        let base = buyIn > 0 ? buyIn : 1_000
+
+        for multiple in 1...20 {
+            let candidate = Money.format(cents: base * multiple).replacingOccurrences(of: "$", with: "")
+            if !existing.contains(candidate) {
+                return candidate
+            }
+        }
+
+        return ""
+    }
+
+    private func normalizedMoneyText(_ text: String) -> String? {
+        guard let cents = Money.cents(from: text), cents > 0 else { return nil }
+        return Money.format(cents: cents).replacingOccurrences(of: "$", with: "")
+    }
+
+    fileprivate static func payoutPercentages(forEntrants entrants: Int) -> [Int] {
+        switch entrants {
+        case 0...2:
+            return [100]
+        case 3...4:
+            return [70, 30]
+        case 5...7:
+            return [60, 30, 10]
+        case 8...10:
+            return [50, 30, 20]
+        default:
+            return [45, 25, 15, 10, 5]
+        }
     }
 
     private func remapTournamentColors(
@@ -834,6 +907,7 @@ struct TournamentSetupView: View {
 
         let currentPlayers = totalPaidEntries
         let currentBuyInCents = buyInCents
+        let currentStartingStackUnits = tournamentStartingStackUnits
         let currentSmallBlind = openingSmallBlind
         let currentBigBlind = openingBigBlind
         let currentChips = activeChips
@@ -842,7 +916,7 @@ struct TournamentSetupView: View {
             await ChipAllocator.rankedAuto(
                 chips: currentChips,
                 players: currentPlayers,
-                buyInCents: currentBuyInCents,
+                buyInCents: currentStartingStackUnits,
                 reservePercent: 0,
                 smallBlindCents: currentSmallBlind,
                 bigBlindCents: currentBigBlind
@@ -854,23 +928,34 @@ struct TournamentSetupView: View {
             allocation: ranked.primaryAllocation
         )
 
-        calculatedAllocation = remappedResult.allocation
-        calculatedChips = remappedResult.allocation.perPlayer.keys.sorted { $0.denominationCents > $1.denominationCents }
+        let calculatedChips = remappedResult.allocation.perPlayer.keys.sorted { $0.denominationCents > $1.denominationCents }
 
         let mappedChips = chips.map { chip in
             remappedResult.chips.first(where: { $0.id == chip.id }) ?? chip
         }
         chips = mappedChips
-        qtyText = Dictionary(uniqueKeysWithValues: mappedChips.map { ($0.id, String($0.quantity)) })
+        calculationSnapshot = CalculationSnapshot(
+            allocation: remappedResult.allocation,
+            chips: calculatedChips,
+            buyInCents: currentBuyInCents,
+            playerCount: currentPlayers,
+            entrantCount: initialEntrants,
+            estimatedDurationText: estimatedDurationText,
+            blindSchedule: blindSchedule,
+            totalPrizePoolCents: totalPrizePoolCents,
+            startingPlayers: players,
+            plannedLateRegistrations: plannedLateRegistrations,
+            plannedRebuys: plannedRebuys,
+            plannedAddOns: plannedAddOns,
+            addOnValueTexts: parsedAddOnValueTexts
+        )
 
         saveCurrentSetup()
         isCalculating = false
-        showResultsSheet = true
     }
 
     private func handleSetupChange() {
-        calculatedAllocation = nil
-        calculatedChips = []
+        calculationSnapshot = nil
         saveCurrentSetup()
     }
 
@@ -910,9 +995,8 @@ struct TournamentSetupView: View {
             plannedLateRegistrations: plannedLateRegistrations,
             plannedRebuys: plannedRebuys,
             plannedAddOns: plannedAddOns,
-            addOnValueTexts: addOnValueTexts,
+            addOnValueTexts: addOnValues.map(\.text),
             blindSpeedRawValue: blindSpeed.rawValue,
-            denominationModeRawValue: DenominationMode.auto.rawValue,
             chips: currentSavedChipRows
         )
 
@@ -927,7 +1011,9 @@ struct TournamentSetupView: View {
         plannedLateRegistrations = saved.plannedLateRegistrations
         plannedRebuys = saved.plannedRebuys
         plannedAddOns = saved.plannedAddOns
-        addOnValueTexts = saved.addOnValueTexts.isEmpty ? ["10", "20"] : saved.addOnValueTexts
+        addOnValues = (saved.addOnValueTexts.isEmpty ? ["10", "20"] : saved.addOnValueTexts)
+            .uniqued()
+            .map { AddOnValueInput(text: $0) }
         blindSpeed = BlindSpeed(rawValue: saved.blindSpeedRawValue) ?? .regular
 
         let rebuilt = saved.chips.map {
@@ -950,8 +1036,9 @@ private struct TournamentResultsSheetView: View {
     @Environment(\.dismiss) private var dismiss
 
     let blindSpeed: String
-    let buyInText: String
+    let buyInCents: Int
     let playerCount: Int
+    let entrantCount: Int
     let allocation: AllocationResult
     let chips: [ChipType]
     let estimatedDurationText: String
@@ -965,21 +1052,22 @@ private struct TournamentResultsSheetView: View {
 
     @State private var extraPlayers = 0
     @State private var extraRebuys = 0
-    @State private var extraAddOnCount = 0
-    @State private var extraAddOnMoneyCents = 0
-    @State private var extraAddOnChipUnits = 0
+    @State private var addedAddOns: [(moneyCents: Int, chipUnits: Int)] = []
     @State private var showNegativeBankAlert = false
     @State private var showAddOnSheet = false
     @State private var showAddOnResultAlert = false
     @State private var addOnResultMessage = ""
-    @State private var selectedAddOnValueText = ""
 
-    private var buyInCents: Int {
-        Money.cents(from: buyInText.replacingOccurrences(of: "$", with: "")) ?? 0
+    private var buyInText: String {
+        Money.format(cents: buyInCents)
     }
 
     private var adjustedPaidEntries: Int {
         playerCount + extraPlayers + extraRebuys
+    }
+
+    private var adjustedEntrants: Int {
+        entrantCount + extraPlayers
     }
 
     private var adjustedPrizePoolCents: Int {
@@ -991,11 +1079,31 @@ private struct TournamentResultsSheetView: View {
     }
 
     private var parsedAddOnOptions: [Int] {
-        addOnValueTexts.compactMap(Money.cents)
+        addOnValueTexts.compactMap { Money.cents(from: $0) }
+    }
+
+    private var extraAddOnCount: Int {
+        addedAddOns.count
+    }
+
+    private var extraAddOnMoneyCents: Int {
+        addedAddOns.reduce(0) { $0 + $1.moneyCents }
+    }
+
+    private var extraAddOnChipUnits: Int {
+        addedAddOns.reduce(0) { $0 + $1.chipUnits }
     }
 
     private var canRemovePlayer: Bool {
         extraPlayers > 0
+    }
+
+    private var canRemoveRebuy: Bool {
+        extraRebuys > 0
+    }
+
+    private var canRemoveAddOn: Bool {
+        extraAddOnCount > 0
     }
 
     private var canAddAnotherFullStack: Bool {
@@ -1003,20 +1111,7 @@ private struct TournamentResultsSheetView: View {
     }
 
     private var adjustedPrizeBreakdown: [ResultsPrizePayout] {
-        let percents: [Int]
-
-        switch adjustedPaidEntries {
-        case 0...2:
-            percents = [100]
-        case 3...4:
-            percents = [70, 30]
-        case 5...7:
-            percents = [60, 30, 10]
-        case 8...10:
-            percents = [50, 30, 20]
-        default:
-            percents = [45, 25, 15, 10, 5]
-        }
+        let percents = TournamentSetupView.payoutPercentages(forEntrants: adjustedEntrants)
 
         var payouts: [ResultsPrizePayout] = []
         var awarded = 0
@@ -1049,6 +1144,7 @@ private struct TournamentResultsSheetView: View {
             "Planned rebuys: \(plannedRebuys + extraRebuys)",
             "Planned add-ons: \(plannedAddOns + extraAddOnCount)",
             "Paid entries: \(adjustedPaidEntries)",
+            "Payout bracket entrants: \(adjustedEntrants)",
             "Prize pool: \(Money.format(cents: adjustedPrizePoolCents))",
             "Starting stack: \(formatUnits(allocation.perPlayerTotalCents))",
             "Chips per player: \(allocation.totalChipsPerPlayer)",
@@ -1104,6 +1200,7 @@ private struct TournamentResultsSheetView: View {
                                 detailRow("Planned rebuys", "\(plannedRebuys + extraRebuys)")
                                 detailRow("Planned add-ons", "\(plannedAddOns + extraAddOnCount)")
                                 detailRow("Paid entries", "\(adjustedPaidEntries)")
+                                detailRow("Payout bracket entrants", "\(adjustedEntrants)")
                                 detailRow("Prize pool", Money.format(cents: adjustedPrizePoolCents))
                                 detailRow("Stack per player", formatUnits(allocation.perPlayerTotalCents))
                                 detailRow("Chips per player", "\(allocation.totalChipsPerPlayer)")
@@ -1188,7 +1285,6 @@ private struct TournamentResultsSheetView: View {
                                     }
 
                                     Button {
-                                        selectedAddOnValueText = addOnValueTexts.first ?? ""
                                         showAddOnSheet = true
                                     } label: {
                                         Text("Add Add-On")
@@ -1205,6 +1301,45 @@ private struct TournamentResultsSheetView: View {
                                     }
                                     .disabled(parsedAddOnOptions.isEmpty)
                                     .opacity(parsedAddOnOptions.isEmpty ? 0.5 : 1.0)
+                                }
+
+                                HStack(spacing: 12) {
+                                    Button {
+                                        guard extraRebuys > 0 else { return }
+                                        extraRebuys -= 1
+                                    } label: {
+                                        Text("Undo Rebuy")
+                                            .fontWeight(.semibold)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 10)
+                                            .background(AppColors.card)
+                                            .foregroundStyle(AppColors.textPrimary)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10)
+                                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                            )
+                                            .cornerRadius(10)
+                                    }
+                                    .disabled(!canRemoveRebuy)
+                                    .opacity(canRemoveRebuy ? 1.0 : 0.5)
+
+                                    Button {
+                                        removeLatestAddOn()
+                                    } label: {
+                                        Text("Undo Add-On")
+                                            .fontWeight(.semibold)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 10)
+                                            .background(AppColors.card)
+                                            .foregroundStyle(AppColors.textPrimary)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10)
+                                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                            )
+                                            .cornerRadius(10)
+                                    }
+                                    .disabled(!canRemoveAddOn)
+                                    .opacity(canRemoveAddOn ? 1.0 : 0.5)
                                 }
                             }
                         }
@@ -1291,7 +1426,7 @@ private struct TournamentResultsSheetView: View {
                     .padding()
                 }
             }
-            .navigationTitle("Tournament Management Beta")
+            .navigationTitle("Tournament Management")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -1320,9 +1455,6 @@ private struct TournamentResultsSheetView: View {
             .sheet(isPresented: $showAddOnSheet) {
                 TournamentAddOnSheetView(
                     addOnValueTexts: addOnValueTexts,
-                    buyInCents: buyInCents,
-                    chips: chips,
-                    allocation: allocation,
                     onConfirm: { selectedText in
                         handleAddOnSelection(selectedText)
                     }
@@ -1372,9 +1504,7 @@ private struct TournamentResultsSheetView: View {
             return
         }
 
-        extraAddOnCount += 1
-        extraAddOnMoneyCents += selectedCents
-        extraAddOnChipUnits += chipUnits
+        addedAddOns.append((moneyCents: selectedCents, chipUnits: chipUnits))
 
         let chipLines = chipBreakdown.compactMap { chip, count -> String? in
             guard count > 0 else { return nil }
@@ -1388,6 +1518,11 @@ private struct TournamentResultsSheetView: View {
         \(chipLines.joined(separator: "\n"))
         """
         showAddOnResultAlert = true
+    }
+
+    private func removeLatestAddOn() {
+        guard !addedAddOns.isEmpty else { return }
+        addedAddOns.removeLast()
     }
 
     private func targetChipUnits(for amountCents: Int) -> Int {
@@ -1467,9 +1602,6 @@ private struct TournamentAddOnSheetView: View {
     @Environment(\.dismiss) private var dismiss
 
     let addOnValueTexts: [String]
-    let buyInCents: Int
-    let chips: [ChipType]
-    let allocation: AllocationResult
     let onConfirm: (String) -> Void
 
     @State private var selectedValueText: String = ""
@@ -1531,6 +1663,19 @@ private struct TournamentAddOnSheetView: View {
         }
         .presentationDetents([.medium])
         .presentationDragIndicator(.visible)
+    }
+}
+
+private extension Array where Element: Hashable {
+    func uniqued() -> [Element] {
+        var seen = Set<Element>()
+        var result: [Element] = []
+
+        for element in self where seen.insert(element).inserted {
+            result.append(element)
+        }
+
+        return result
     }
 }
 
